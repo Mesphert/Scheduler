@@ -1,54 +1,85 @@
-import { COMPETITIONS } from './config.js';
+// SportAPI (sportapi.ai) — GET /api/fixtures/date/{YYYY-MM-DD} with X-Api-Key header
+const BASE = 'https://sportapi.ai/api';
+const TTL_NEAR = 2 * 60 * 1000;        // today / yesterday: 2 min
+const TTL_FAR = 6 * 60 * 60 * 1000;    // future days: 6 h
 
-const BASE = 'https://site.api.espn.com/apis/site/v2/sports/soccer';
-const ymd = (d) =>
-  `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
+export class ApiError extends Error {
+  constructor(code, msg) { super(msg); this.code = code; }
+}
 
-function parse(ev, comp) {
-  const c = ev.competitions?.[0];
-  const home = c?.competitors?.find((x) => x.homeAway === 'home');
-  const away = c?.competitors?.find((x) => x.homeAway === 'away');
-  if (!home || !away) return null;
-  const team = (x) => ({
-    name: x.team?.shortDisplayName || x.team?.displayName || 'TBD',
-    logo: x.team?.logo || x.team?.logos?.[0]?.href || '',
-    score: x.score ?? '',
-  });
-  const st = ev.status?.type || c.status?.type || {};
+const dstr = (d) => d.toISOString().slice(0, 10);
+
+// Map a SportAPI fixture to one of our four competitions (or null to ignore it)
+function matchComp(f) {
+  const n = (f.league_name || '').trim();
+  const eng = f.league_geo === 'GB-ENG' || /england/i.test(f.league_zone || '');
+  if (f.league_id === 24 || (eng && /^premier league$/i.test(n))) return ['eng.1', 'EPL', 'Premier League'];
+  if (f.league_id === 18 || /^uefa champions league$/i.test(n)) return ['uefa.champions', 'UCL', 'Champions League'];
+  if (/^(english )?fa cup$/i.test(n)) return ['eng.fa', 'FA Cup', 'FA Cup'];
+  if (/carabao/i.test(n) || /^(english )?(efl|league) cup$/i.test(n)) return ['eng.league_cup', 'Carabao Cup', 'Carabao Cup'];
+  return null;
+}
+
+// "espn-359.png" -> ESPN's public club-logo CDN
+function logoUrl(file) {
+  const m = /^espn-(\d+)\.png$/.exec(file || '');
+  return m ? `https://a.espncdn.com/i/teamlogos/soccer/500/${m[1]}.png` : '';
+}
+
+function parse(f) {
+  const c = matchComp(f);
+  if (!c) return null;
+  const st = f.status || 'Scheduled';
+  const state = st === 'LIVE' ? 'in' : ['FT', 'AET', 'PENS'].includes(st) ? 'post' : 'pre';
+  let statusText = { Scheduled: '', FT: 'FT', AET: 'AET', PENS: 'Pens', Postponed: 'Postponed', Cancelled: 'Cancelled', Suspended: 'Suspended' }[st] ?? st;
+  if (st === 'PENS' && f.penalty_home != null) statusText = `Pens ${f.penalty_home}-${f.penalty_away}`;
   return {
-    id: String(ev.id),
-    at: new Date(ev.date).getTime(),
-    comp: comp.key,
-    compShort: comp.short,
-    compName: comp.name,
-    home: team(home),
-    away: team(away),
-    state: st.state,                 // pre | in | post
-    statusName: st.name,             // STATUS_SCHEDULED, STATUS_POSTPONED...
-    statusText: st.shortDetail || st.description || '',
-    clock: ev.status?.displayClock || '',
+    id: String(f.id),
+    at: new Date(f.kickoff_utc).getTime(),
+    comp: c[0], compShort: c[1], compName: c[2],
+    home: { name: f.home_short || f.home_team || 'TBD', logo: logoUrl(f.home_logo), score: f.home_score ?? '' },
+    away: { name: f.away_short || f.away_team || 'TBD', logo: logoUrl(f.away_logo), score: f.away_score ?? '' },
+    state,
+    statusName: st === 'Scheduled' ? 'STATUS_SCHEDULED' : st.toUpperCase(),
+    statusText,
+    clock: f.minute || '',
   };
 }
 
-async function fetchCompetition(comp, days) {
-  const start = new Date(Date.now() - 86400000);
-  const end = new Date(Date.now() + days * 86400000);
-  const url = `${BASE}/${comp.key}/scoreboard?dates=${ymd(start)}-${ymd(end)}&limit=300`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('HTTP ' + res.status);
+const cacheGet = (d) => { try { return JSON.parse(localStorage.getItem('dc:' + d)); } catch { return null; } };
+const cacheSet = (d, data) => { try { localStorage.setItem('dc:' + d, JSON.stringify({ t: Date.now(), data })); } catch {} };
+
+async function fetchDate(date, key, near, force) {
+  const c = cacheGet(date);
+  if (c && !(force && near) && Date.now() - c.t < (near ? TTL_NEAR : TTL_FAR)) return c.data;
+  const res = await fetch(`${BASE}/fixtures/date/${date}`, { headers: { 'X-Api-Key': key } });
+  if (res.status === 401) throw new ApiError('auth', 'Invalid API key. Check it in Settings.');
+  if (res.status === 429) throw new ApiError('limit', 'Daily API request limit reached. Try again after 00:00 UTC.');
+  if (!res.ok) throw new ApiError('http', 'Server error ' + res.status);
   const json = await res.json();
-  return (json.events || []).map((e) => parse(e, comp)).filter(Boolean);
+  const data = (json.data || []).map(parse).filter(Boolean);
+  cacheSet(date, data);
+  return data;
 }
 
-// Returns fixtures from every competition that answered. Throws only if ALL failed.
-export async function fetchAll(days) {
-  const results = await Promise.allSettled(COMPETITIONS.map((c) => fetchCompetition(c, days)));
-  if (results.every((r) => r.status === 'rejected')) throw new Error('offline');
-  const seen = new Set();
+// One request per day (yesterday .. +days), cached per day to save quota
+export async function fetchAll(days, key, { force = false } = {}) {
+  if (!key) throw new ApiError('nokey', 'Add your SportAPI key in Settings to load fixtures.');
+  const dates = [];
+  for (let i = -1; i <= days; i++) dates.push(dstr(new Date(Date.now() + i * 86400000)));
+  const today = dstr(new Date());
   const out = [];
-  for (const r of results) {
-    if (r.status !== 'fulfilled') continue;
-    for (const f of r.value) if (!seen.has(f.id)) { seen.add(f.id); out.push(f); }
+  let ok = 0, firstErr = null;
+  for (let i = 0; i < dates.length; i += 5) {
+    const batch = dates.slice(i, i + 5);
+    const res = await Promise.allSettled(batch.map((d) => fetchDate(d, key, d <= today, force)));
+    res.forEach((r) => {
+      if (r.status === 'fulfilled') { ok++; out.push(...r.value); }
+      else if (!firstErr) firstErr = r.reason;
+    });
+    if (firstErr && firstErr.code && firstErr.code !== 'http') break; // auth / limit: stop early
   }
-  return out;
+  if (!ok) throw firstErr || new Error('failed');
+  const seen = new Set();
+  return out.filter((f) => !seen.has(f.id) && seen.add(f.id));
 }

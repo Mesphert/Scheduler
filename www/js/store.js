@@ -4,6 +4,7 @@ const get = (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON
 const set = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
 const DEFAULTS = {
+  apiKey: '',           // SportAPI key, entered in Settings
   theme: 'system',      // system | light | dark
   leadMin: 5,           // minutes before the event
   days: 14,             // fixture window

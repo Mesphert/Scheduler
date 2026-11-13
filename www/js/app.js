@@ -64,18 +64,25 @@ function pruneItems() {
 }
 
 /* ---------- fixtures ---------- */
-async function loadFixtures() {
-  state.loading = true; state.error = null; render();
+async function loadFixtures(force = false) {
+  state.loading = true; state.error = null; state.errCode = null; render();
   try {
-    const data = await fetchAll(settings.days);
+    const data = await fetchAll(settings.days, settings.apiKey, { force });
     state.fixtures = data; state.offline = false;
     S.saveCache(data);
     await syncKickoffs(data);
-  } catch {
-    if (state.fixtures.length) state.offline = true;
+  } catch (e) {
+    state.errCode = e.code || 'net';
+    if (e.code) state.error = e.message;
+    else if (state.fixtures.length) state.offline = true;
     else state.error = 'Couldn’t load fixtures. Check your connection.';
   }
   state.loading = false; render();
+}
+
+function logoEl(t, cls = '') {
+  if (t.logo) return `<img class="logo ${cls}" src="${esc(t.logo)}" alt="">`;
+  return `<span class="logo ph ${cls}">${esc((t.name || '?').slice(0, 3).toUpperCase())}</span>`;
 }
 
 // If ESPN moved a kick-off, move the reminder too
@@ -113,9 +120,9 @@ function fixtureCard(f) {
   return `<article class="card fixture">
     <div class="comp">${esc(f.compName)}</div>
     <div class="match">
-      <div class="team"><img class="logo" src="${esc(f.home.logo)}" alt=""><span>${esc(f.home.name)}</span></div>
+      <div class="team">${logoEl(f.home)}<span>${esc(f.home.name)}</span></div>
       <div class="mid">${mid}</div>
-      <div class="team"><img class="logo" src="${esc(f.away.logo)}" alt=""><span>${esc(f.away.name)}</span></div>
+      <div class="team">${logoEl(f.away)}<span>${esc(f.away.name)}</span></div>
     </div>${foot}</article>`;
 }
 
@@ -133,8 +140,10 @@ function renderFixtures() {
       present.map((c) => `<button class="chip ${state.filter === c.key ? 'active' : ''}" data-filter="${c.key}">${esc(c.short)}</button>`).join('') + '</div>';
   }
   if (state.offline) html += '<p class="note">Offline — showing saved fixtures.</p>';
+  const needKey = state.errCode === 'nokey' || state.errCode === 'auth';
+  if (state.error && list.length) html += `<p class="note err">${esc(state.error)}</p>`;
   if (state.loading && !list.length) html += '<p class="empty">Loading fixtures…</p>';
-  else if (state.error) html += `<p class="empty">${esc(state.error)}</p>`;
+  else if (state.error && !list.length) html += `<div class="empty">${esc(state.error)}${needKey ? '<br><br><button class="btn" data-tab="settings">Open Settings</button>' : ''}</div>`;
   else if (!list.length) html += `<p class="empty">No fixtures in the next ${settings.days} days.</p>`;
 
   let lastDay = '';
@@ -177,7 +186,7 @@ function itemCard(i) {
   const past = i.at <= Date.now();
   const lead = settings.leadMin;
   const left = i.type === 'fixture'
-    ? `<div class="pair"><img class="logo sm" src="${esc(i.home.logo)}" alt=""><img class="logo sm" src="${esc(i.away.logo)}" alt=""></div>`
+    ? `<div class="pair">${logoEl(i.home, 'sm')}${logoEl(i.away, 'sm')}</div>`
     : `<div class="bell">${icons.bell}</div>`;
   const title = i.type === 'fixture' ? `${esc(i.home.name)} vs ${esc(i.away.name)}` : esc(i.title);
   const sub = i.type === 'fixture' ? esc(i.compName) : 'Custom reminder';
@@ -255,12 +264,25 @@ function renderSettings() {
       ${COMPETITIONS.map((c) => `<div class="row"><span>${esc(c.name)}</span>${sw(`data-comp="${c.key}"`, settings.comps[c.key])}</div>`).join('')}
     </div>
 
+    <h2 class="group-title">Data</h2>
+    <div class="group">
+      <div class="row col">
+        <span>SportAPI key</span>
+        <input id="keyInput" class="field" type="password" placeholder="sk_live_…" value="${esc(settings.apiKey)}" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button class="btn wide" data-action="savekey">Save &amp; refresh</button>
+        <small class="muted">Free key: sportapi.ai → API keys</small>
+      </div>
+      <div class="row col"><span>Competitions found</span>
+        <small class="muted">${COMPETITIONS.map((c) => `${esc(c.short)} ${state.fixtures.filter((f) => f.comp === c.key).length}`).join(' · ')}</small>
+      </div>
+    </div>
+
     <h2 class="group-title">Other</h2>
     <div class="group">
       <div class="row"><span>Send test notification</span><button class="btn" data-action="test">Test</button></div>
       <div class="row"><span>Clear all scheduled</span><button class="btn danger" data-action="clear">Clear</button></div>
     </div>
-    <p class="note center">Fixture data: ESPN public scoreboard</p>`;
+    <p class="note center">Fixture data: SportAPI</p>`;
 
   N.exactAlarmOk().then((ok) => {
     const r = $('#exactRow');
@@ -329,8 +351,12 @@ document.addEventListener('click', async (e) => {
     for (const i of items) await N.cancel(i.nid);
     items = []; S.saveItems(items); render(); toast('Cleared');
   }
+  else if (d.action === 'savekey') {
+    setSetting({ apiKey: $('#keyInput').value.trim() });
+    toast('Key saved'); loadFixtures(true);
+  }
   else if (d.action === 'exact') await N.openExactSettings();
-  else if (t.id === 'refresh') loadFixtures();
+  else if (t.id === 'refresh') loadFixtures(true);
   else if (t.id === 'addCustom') await addCustom();
 });
 
