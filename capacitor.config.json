@@ -1,0 +1,14 @@
+{
+  "appId": "com.d4vit.scheduler",
+  "appName": "Scheduler",
+  "webDir": "www",
+  "plugins": {
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_icon",
+      "iconColor": "#6C8CFF"
+    },
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}
